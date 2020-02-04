@@ -1,619 +1,674 @@
+#define _GNU_SOURCE
+#include <sys/types.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <time.h>
+#include <errno.h>
+#include <unistd.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/fcntl.h>
+#include <sys/stat.h>
+#include <netdb.h>
+#include <sys/select.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
 
-#include "main.h"
+#define BUFSIZE 65536
+#define IPSIZE 4
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
+#define ARRAY_INIT    {0}
 
+unsigned short int port = 1080;
+int daemon_mode = 0;
+int auth_type;
+char *arg_username;
+char *arg_password;
+FILE *log_file;
+pthread_mutex_t lock;
 
-int decodeBMPIMG(struct imageinfo *bmpinfo)
+enum socks {
+	RESERVED = 0x00,
+	VERSION4 = 0x04,
+	VERSION5 = 0x05
+};
+
+enum socks_auth_methods {
+	NOAUTH = 0x00,
+	USERPASS = 0x02,
+	NOMETHOD = 0xff
+};
+
+enum socks_auth_userpass {
+	AUTH_OK = 0x00,
+	AUTH_VERSION = 0x01,
+	AUTH_FAIL = 0xff
+};
+
+enum socks_command {
+	CONNECT = 0x01
+};
+
+enum socks_command_type {
+	IP = 0x01,
+	DOMAIN = 0x03
+};
+
+enum socks_status {
+	OK = 0x00,
+	FAILED = 0x05
+};
+
+void log_message(const char *message, ...)
 {
-  //  struct imageinfo *decodedbmp;
-  
-    static const unsigned MINHEADER = 54; //minimum BMP header size
-   // decodedbmp=(struct imageinfo*)malloc(sizeof(struct imageinfo));
-    
-
-  if(bmpinfo->size < MINHEADER) return 1;
-  if(bmpinfo->data[0] != 'B' || bmpinfo->data[1] != 'M') return 2; //It's not a BMP file if it doesn't start with marker 'BM'
-
-  uint32_t pixeloffset = bmpinfo->data[10] + 256 * bmpinfo->data[11]; //where the pixel data starts
-  //read width and height from BMP header
-bmpinfo->w= bmpinfo->data[18] + bmpinfo->data[19] * 256;
-  bmpinfo->h = bmpinfo->data[22] + bmpinfo->data[23] * 256;
-  //read number of channels from BMP header
-  if(bmpinfo->data[28] != 24 && bmpinfo->data[28] != 32) return 4; //only 24-bit and 32-bit BMPs are supported.
-  uint32_t numChannels = bmpinfo->data[28] / 8;
-
-  //The amount of scanline bytes is width of image times channels, with extra bytes added if needed
-  //to make it a multiple of 4 bytes.
- uint32_t scanlineBytes = bmpinfo->w * numChannels;
-  if(scanlineBytes % 4 != 0) scanlineBytes = (scanlineBytes / 4) * 4 + 4;
-
-uint32_t dataSize = scanlineBytes *bmpinfo->h;
-  if(bmpinfo->size < dataSize + pixeloffset) return -1; //BMP file too small to contain all pixels
-
-//resizing
-bmpinfo->size=bmpinfo->w * bmpinfo->h  * 4;
-uint8_t *temp=(uint8_t*)malloc(bmpinfo->size);
-  /*
-  There are 3 differences between BMP and the raw image buffer for LodePNG:
-  -it's upside down
-  -it's in BGR instead of RGB format (or BRGA instead of RGBA)
-  -each scanline has padding bytes to make it a multiple of 4 if needed
-  The 2D for loop below does all these 3 conversions at once.
-  */
-  for(unsigned y = 0; y < bmpinfo->h; y++)
-  for(unsigned x = 0; x < bmpinfo->w; x++) {
-    //pixel start byte position in the BMP
-    unsigned bmpos = pixeloffset + (bmpinfo->h - y - 1) * scanlineBytes + numChannels * x;
-    //pixel start byte position in the new raw image
-    unsigned newpos = 4 * y * bmpinfo->w + 4 * x;
-    if(numChannels == 3) {
-       // printf("color\n");
-     temp[newpos + 0] = bmpinfo->data[bmpos + 2]; //R
-     temp[newpos + 1] = bmpinfo->data[bmpos + 1]; //G
-     temp[newpos + 2] = bmpinfo->data[bmpos + 0]; //B
-     temp[newpos + 3] = 255;            //A
-    } else {
-     temp[newpos + 0] = bmpinfo->data[bmpos + 2]; //R
-     temp[newpos + 1] = bmpinfo->data[bmpos + 1]; //G
-      temp[newpos + 2] = bmpinfo->data[bmpos + 0]; //B
-      temp[newpos + 3] = bmpinfo->data[bmpos + 3]; //A
-      
-    }
-  }
-  bmpinfo->data=(uint8_t*)realloc(bmpinfo->data,bmpinfo->size);
-  memcpy(bmpinfo->data,temp,bmpinfo->size);
-  free(temp);
-  
-  return 0;
-    
-}
-
-struct imageinfo *getBitmapScreenshot()
-{
-  
-    struct imageinfo *bmpinfo=(struct imageinfo*)malloc(sizeof(struct imageinfo));
-    uint16_t BitsPerPixel =24;
-    uint32_t Width= GetSystemMetrics(SM_CXSCREEN);
-    uint32_t Height =  GetSystemMetrics(SM_CYSCREEN);
-    
-     // Create Header
-    BITMAPFILEHEADER Header;
-    memset(&Header, 0, sizeof(Header));
-    Header.bfType = 0x4D42;
-    Header.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
-
-    // Create Info
-    BITMAPINFO Info;
-    memset(&Info, 0, sizeof(Info));
-    Info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    Info.bmiHeader.biWidth = Width;
-    Info.bmiHeader.biHeight = Height;
-    Info.bmiHeader.biPlanes = 1;
-    Info.bmiHeader.biBitCount = BitsPerPixel;
-    Info.bmiHeader.biCompression = BI_RGB;
-    Info.bmiHeader.biSizeImage = Width * Height * (BitsPerPixel > 24 ? 4 : 3);
-    uint8_t * Pixels=NULL;
-    HDC MemDC = CreateCompatibleDC(0);//Context);
-    HBITMAP Section = CreateDIBSection(MemDC, &Info, DIB_RGB_COLORS, (void**)&Pixels, 0, 0);
- 
-  CURSORINFO cursor = { sizeof(cursor) };
-	GetCursorInfo(&cursor);
-     int x,y;
-	if (cursor.flags == CURSOR_SHOWING) 
-	{
-		RECT rcWnd;
-		RECT rc;
-		HWND hwnd = GetDesktopWindow();
-		GetWindowRect(hwnd,&rc);
-
-		POINT point;
-		GetCursorPos(&point);
-
-		GetWindowRect(hwnd, &rcWnd);
-        
-		//_ICONINFOEXW
-        ICONINFO info = { sizeof(info) };
-        GetIconInfo(cursor.hCursor,&info);
-		 x = point.x;
-		 y = point.y;
-		
-
-	}
-    
-    
-   
-    DeleteObject(SelectObject(MemDC, Section));
-    BitBlt(MemDC, 0, 0, Width, Height, GetDC(0), 0, 0, SRCCOPY);
-    DrawIcon(MemDC,x,y,cursor.hCursor);
-    
-    
-    DeleteDC(MemDC);
-   
-      // Concatenate everything
-    bmpinfo->data = (uint8_t*)malloc(sizeof(Header) + sizeof(Info.bmiHeader) + (((BitsPerPixel * Width + 31) & ~31) / 8) * Height);
-
-    memcpy(bmpinfo->data , (unsigned char*)&Header, sizeof(Header));
-    memcpy(bmpinfo->data  + sizeof(Header), ( unsigned char*)&Info.bmiHeader, sizeof(Info.bmiHeader));
-    memcpy(bmpinfo->data  + sizeof(Header) + sizeof(Info.bmiHeader), Pixels, (((BitsPerPixel * Width + 31) & ~31) / 8) * Height);
-     size_t size=sizeof(Header) + sizeof(Info.bmiHeader) + (((BitsPerPixel * Width + 31) & ~31) / 8) * Height;
-     //memcpy(bmpinfo->data,bmp,size);
-     //free(bmp);
-     bmpinfo->size=size;
-     DeleteObject(Section);
-    return bmpinfo;
-    
-    
-}
-
-struct imageinfo *getPNGfromBMP(struct imageinfo *imginfo)
-{
-    int pnginfo;
-   
-    pnginfo=decodeBMPIMG(imginfo);
-   
-    if(pnginfo!=0)
-    {
-        printf("BMP decoding error  \n");
-        return NULL;
-    }
-    
-     struct imageinfo *pngimage=(struct imageinfo*)malloc(sizeof(struct imageinfo));
-     pngimage->w=imginfo->w;
-     pngimage->h=imginfo->h;
-   
-    lodepng_encode_memory(&pngimage->data,&pngimage->size,imginfo->data,imginfo->w,imginfo->h,LCT_RGBA, 8);
-    
-   
-    
-    
-    return pngimage;
-    
-}
-
-
-int CreateSocketInformation(struct arguments *args, SOCKET ClientSocket)
-{
-    struct session *s = malloc(sizeof(struct session));
-    s->client=ClientSocket;
-    s->id=args->scount++;
-    s->next=NULL;
-    s->tcp.client_state=CONNECTED;
-    s->tcp.received=0;
-    s->tcp.sent=0;
-    s->tcp.forward=NULL;
-    // Search session add new connection at end
-	/*struct session *cur = args->ctx->session;
-	struct session *p=NULL;
-	/while (cur != NULL){
-		p=cur;
-		cur = cur->next;
-		
-	}*/
-    s->next = args->ctx->session;
-	args->ctx->session = s;
-    
-	 
-    
-}
-void queue_client_data(const struct arguments *args, struct tcp_session *cur, const uint8_t *data,uint32_t datalen)
-{
-	struct segment *p = NULL;
-	struct segment *s = cur->forward;
-
-	while (s != NULL)
-	{
-
-		p = s;
-		s = s->next;
+	if (daemon_mode) {
+		return;
 	}
 
-	
-		struct segment *n = (struct segment *) malloc(sizeof(struct segment));
+	char vbuffer[255];
+	va_list args;
+	va_start(args, message);
+	vsnprintf(vbuffer, ARRAY_SIZE(vbuffer), message, args);
+	va_end(args);
 
-		n->len = datalen;
-		n->sent = 0;
-		n->data = (uint8_t*) malloc(datalen);
-		memcpy(n->data, data, datalen);
-       
-		n->next = s;
-		if (p == NULL)
-			cur->forward = n;
-		else
-			p->next = n;
-	
-}
+	time_t now;
+	time(&now);
+	char *date = ctime(&now);
+	date[strlen(date) - 1] = '\0';
 
-int monitor_tcp_session(const struct arguments *args, struct session *s) {
+	pthread_t self = pthread_self();
 
-    
-  if(s->tcp.client_state == CONNECTED){
-           
-        
-        if(s->tcp.forward !=NULL)
-            FD_SET(s->client,&args->ctx->WriteSet);
-        else{
-            printf("\nset to read");
-             FD_SET(s->client,&args->ctx->ReadSet);
-             
-        }
-        }
-        else{
-        return 0;
-        }
-
-  	return 1;
-}
-int check_tcp_session(const struct arguments *args,struct session *s)
-{
-    if(s->tcp.client_state == CLOSED)
-    {
-        printf("\nclosed");
-        closesocket(s->client);
-        return 1;
-    }
-    return 0;
-       
-}
-void clear_tcp_data(struct tcp_session *cur)
-{
-	struct segment *s = cur->forward;
-	while (s != NULL)
-	{
-		struct segment *p = s;
-		s = s->next;
-		free(p->data);
-		free(p);
+	if (errno != 0) {
+		pthread_mutex_lock(&lock);
+		fprintf(log_file, "[%s][%lu] Critical: %s - %s\n", date, self,
+			vbuffer, strerror(errno));
+		errno = 0;
+		pthread_mutex_unlock(&lock);
+	} else {
+		fprintf(log_file, "[%s][%lu] Info: %s\n", date, self, vbuffer);
 	}
+	fflush(log_file);
 }
 
-
-int main(int argc, char **argv)
+int readn(int fd, void *buf, int n)
 {
-	printf("Screen Capture Application\n");
-    printf("*************************\n");
-       char q;
-  
-  //socket
-   WSADATA wsaData;
-    int iResult;
-      int Ret;
-int total;
-
-   
-    SOCKET ListenSocket = INVALID_SOCKET;
-    SOCKET ClientSocket = INVALID_SOCKET;
-
-    
-    struct addrinfo *result = NULL;
-    struct addrinfo hints;
-
-    int iSendResult;
-    int port=5000;
-    char recvbuf[DEFAULT_BUFLEN];
-    int recvbuflen = DEFAULT_BUFLEN;
-    
-    // Initialize Winsock
-    iResult = WSAStartup(MAKEWORD(2,2), &wsaData);
-    if (iResult != 0) {
-        printf("WSAStartup failed with error: %d\n", iResult);
-        return 1;
-    }
-
-    ZeroMemory(&hints, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    hints.ai_flags = AI_PASSIVE;
-
-    // Resolve the server address and port
-    iResult = getaddrinfo(NULL, "5000", &hints, &result);
-    if ( iResult != 0 ) {
-        printf("getaddrinfo failed with error: %d\n", iResult);
-        WSACleanup();
-        return 1;
-    }
-
-    // Create a SOCKET for connecting to server
-   
-    ListenSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-    if (ListenSocket == INVALID_SOCKET) {
-        printf("socket failed with error: %d\n", WSAGetLastError());
-        freeaddrinfo(result);
-        WSACleanup();
-        return 1;
-    }
-
-    // Setup the TCP listening socket
-    iResult = bind( ListenSocket, result->ai_addr, (int)result->ai_addrlen);
-    if (iResult == SOCKET_ERROR) {
-        printf("bind failed with error: %d\n", WSAGetLastError());
-        freeaddrinfo(result);
-        closesocket(ListenSocket);
-        WSACleanup();
-        return 1;
-    }
-
-    freeaddrinfo(result);
-    struct arguments *args = (struct arguments *) malloc(sizeof(struct arguments));
-	struct context *ctx = (struct context *) malloc(sizeof(struct context));
-	memset(ctx, 0, sizeof(struct context));
-	args->ctx = ctx;
-	args->server = ListenSocket;
-	args->port = port;
-    iResult = listen(ListenSocket, SOMAXCONN);
-    if (iResult == SOCKET_ERROR) {
-        printf("listen failed with error: %d\n", WSAGetLastError());
-        closesocket(ListenSocket);
-        WSACleanup();
-        return 1;
-    }
-
-
- u_long NonBlock = 1;
-
-   if (ioctlsocket(ListenSocket, FIONBIO, &NonBlock) == SOCKET_ERROR)
-
-   {
-
-      printf("ioctlsocket() failed with error %d\n", WSAGetLastError());
-
-      return 1;
-
-   }
-   
-      struct timeval timeout;
-      timeout.tv_sec=5;
-      int i;
-      
-      printf("\n Server is running on port:%d",port);
-while(TRUE)
-
-   {
-         // Prepare the Read and Write socket sets for network I/O notification
-
-      FD_ZERO(&args->ctx->ReadSet);
-
-      FD_ZERO(&args->ctx->WriteSet);
-
- 
-     // Always look for connection attempts
-
-      FD_SET(args->server, &args->ctx->ReadSet);
-      struct session *s = args->ctx->session;
-
-		while (s != NULL)
-		{
-
-		//printf("\ncheckin monitor");
-			monitor_tcp_session(args,s);
-        
-			
-			s = s->next;
-            
-		}
-struct session *sl = NULL;
-s = args->ctx->session;
-			while (s != NULL)
-			{
-				int del = 0;
-
-								
-					del = check_tcp_session(args, s);
-
-				if (del)
-				{
-
-					if (sl == NULL)
-						args->ctx->session = s->next;
-					else
-						sl->next = s->next;
-
-					struct session *c = s;
-					s = s->next;
-					
-						
-					
-					clear_tcp_data(&c->tcp);
-					printf("\nclosed session id:%d ",c->id);
-					
-					free(c);
-					
-					
-				}
-				else
-				{
-					sl = s;
-					s = s->next;
-				}
+	int nread, left = n;
+	while (left > 0) {
+		if ((nread = read(fd, buf, left)) == -1) {
+			if (errno == EINTR || errno == EAGAIN) {
+				continue;
 			}
+		} else {
+			if (nread == 0) {
+				return 0;
+			} else {
+				left -= nread;
+				buf += nread;
+			}
+		}
+	}
+	return n;
+}
 
-     // printf("\nfdcount:%d",args->ctx->ReadSet.fd_count);
-       if ((total = select(0, &args->ctx->ReadSet, &args->ctx->WriteSet, NULL, &timeout)) == SOCKET_ERROR)
+int writen(int fd, void *buf, int n)
+{
+	int nwrite, left = n;
+	while (left > 0) {
+		if ((nwrite = write(fd, buf, left)) == -1) {
+			if (errno == EINTR || errno == EAGAIN) {
+				continue;
+			}
+		} else {
+			if (nwrite == n) {
+				return 0;
+			} else {
+				left -= nwrite;
+				buf += nwrite;
+			}
+		}
+	}
+	return n;
+}
 
-      {
+void app_thread_exit(int ret, int fd)
+{
+	close(fd);
+	pthread_exit((void *)&ret);
+}
 
-         printf("select() returned with error %d\n", WSAGetLastError());
+int app_connect(int type, void *buf, unsigned short int portnum)
+{
+	int fd;
+	struct sockaddr_in remote;
+	char address[16];
 
-         return 1;
+	memset(address, 0, ARRAY_SIZE(address));
 
-      }
+	if (type == IP) {
+		char *ip = (char *)buf;
+		snprintf(address, ARRAY_SIZE(address), "%hhu.%hhu.%hhu.%hhu",
+			 ip[0], ip[1], ip[2], ip[3]);
+		memset(&remote, 0, sizeof(remote));
+		remote.sin_family = AF_INET;
+		remote.sin_addr.s_addr = inet_addr(address);
+		remote.sin_port = htons(portnum);
 
-         
-         // Check for arriving connections on the listening socket.
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (connect(fd, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+			log_message("connect() in app_connect");
+			close(fd);
+			return -1;
+		}
 
-      if (FD_ISSET(args->server, &args->ctx->ReadSet))
+		return fd;
+	} else if (type == DOMAIN) {
+		char portaddr[6];
+		struct addrinfo *res;
+		snprintf(portaddr, ARRAY_SIZE(portaddr), "%d", portnum);
+		log_message("getaddrinfo: %s %s", (char *)buf, portaddr);
+		int ret = getaddrinfo((char *)buf, portaddr, NULL, &res);
+		if (ret == EAI_NODATA) {
+			return -1;
+		} else if (ret == 0) {
+			struct addrinfo *r;
+			for (r = res; r != NULL; r = r->ai_next) {
+				fd = socket(r->ai_family, r->ai_socktype,
+					    r->ai_protocol);
+                if (fd == -1) {
+                    continue;
+                }
+				ret = connect(fd, r->ai_addr, r->ai_addrlen);
+				if (ret == 0) {
+					freeaddrinfo(res);
+					return fd;
+                } else {
+                    close(fd);
+                }
+			}
+		}
+		freeaddrinfo(res);
+		return -1;
+	}
 
-      {
-          total--;
-          SOCKET newsocket;
-          if ((newsocket = accept(args->server, NULL, NULL)) != INVALID_SOCKET)
+    return -1;
+}
 
-         {
+int socks_invitation(int fd, int *version)
+{
+	char init[2];
+	int nread = readn(fd, (void *)init, ARRAY_SIZE(init));
+	if (nread == 2 && init[0] != VERSION5 && init[0] != VERSION4) {
+        log_message("They send us %hhX %hhX", init[0], init[1]);
+		log_message("Incompatible version!");
+		app_thread_exit(0, fd);
+	}
+	log_message("Initial %hhX %hhX", init[0], init[1]);
+	*version = init[0];
+	return init[1];
+}
 
-            // Set the accepted socket to non-blocking mode so the server will
+char *socks5_auth_get_user(int fd)
+{
+	unsigned char size;
+	readn(fd, (void *)&size, sizeof(size));
 
-            // not get caught in a blocked condition on WSASends
+	char *user = (char *)malloc(sizeof(char) * size + 1);
+	readn(fd, (void *)user, (int)size);
+	user[size] = 0;
 
-            NonBlock = 1;
+	return user;
+}
 
-            if (ioctlsocket(newsocket, FIONBIO, &NonBlock) == SOCKET_ERROR)
+char *socks5_auth_get_pass(int fd)
+{
+	unsigned char size;
+	readn(fd, (void *)&size, sizeof(size));
 
-            {
+	char *pass = (char *)malloc(sizeof(char) * size + 1);
+	readn(fd, (void *)pass, (int)size);
+	pass[size] = 0;
 
-               printf("ioctlsocket(FIONBIO) failed with error %d\n", WSAGetLastError());
+	return pass;
+}
 
-              // return 1;
+int socks5_auth_userpass(int fd)
+{
+	char answer[2] = { VERSION5, USERPASS };
+	writen(fd, (void *)answer, ARRAY_SIZE(answer));
+	char resp;
+	readn(fd, (void *)&resp, sizeof(resp));
+	log_message("auth %hhX", resp);
+	char *username = socks5_auth_get_user(fd);
+	char *password = socks5_auth_get_pass(fd);
+	log_message("l: %s p: %s", username, password);
+	if (strcmp(arg_username, username) == 0
+	    && strcmp(arg_password, password) == 0) {
+		char answer[2] = { AUTH_VERSION, AUTH_OK };
+		writen(fd, (void *)answer, ARRAY_SIZE(answer));
+		free(username);
+		free(password);
+		return 0;
+	} else {
+		char answer[2] = { AUTH_VERSION, AUTH_FAIL };
+		writen(fd, (void *)answer, ARRAY_SIZE(answer));
+		free(username);
+		free(password);
+		return 1;
+	}
+}
 
-            }
-
-            else
-               printf("ioctlsocket(FIONBIO) is OK!\n");
-
- 
-
-            if (CreateSocketInformation(args,newsocket) == 0)
-
-            {
-
-                 printf("CreateSocketInformation(AcceptSocket) failed!\n");
-
-                 //return 1;
-
-            }
-
-            else
-
-                printf("CreateSocketInformation() is OK!\n");
-
- 
-
-         }
-         else
-         {
-
-            if (WSAGetLastError() != WSAEWOULDBLOCK)
-
-            {
-
-               printf("accept() failed with error %d\n", WSAGetLastError());
-
-               return 1;
-
-            }
-
-            else
-
-               printf("accept() is fine!\n");
-
-         }
-      }
-         struct session *ses=args->ctx->session;
-         for (i = 0; total>0 && ses!=NULL; i++)
-            {
-            //    printf("\nenterinf=g loop");
-               
-                    if(FD_ISSET(ses->client,&args->ctx->ReadSet))
-                    {
-                        total--;
-                          iResult = recv(ses->client, recvbuf, recvbuflen, 0);
-                          
-        if (iResult > 0) {
-           // printf("Bytes received: %d\n", iResult);
-            ses->tcp.received+=iResult;
-            
-          unsigned  char okmsg[260];
-            
-          //  printf("\nrcvd:%s",recvbuf);
- struct imageinfo *img= getBitmapScreenshot();
-     // printf("\nwidth:%d -- height:%d",img->w,img->h);
-  if(img!=NULL){
-      printf("\nimg->size:%d",img->size);
-       struct imageinfo *pngimg=getPNGfromBMP(img);
-       
-        printf("\nnew png image sent size:%d",pngimg->size);
-       // sprintf(okmsg,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: HSmrc0sMlYUkAGmm5OPpG2HaGWk=\r\nSec-WebSocket-Protocol: chat\r\n");
-    sprintf(okmsg,"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %d\r\n\r\n",pngimg->size);
-   queue_client_data(args,&ses->tcp,okmsg,strlen(okmsg));
-    queue_client_data(args,&ses->tcp,pngimg->data,pngimg->size);
-    free(pngimg->data);
-    free(pngimg);
-      free(img->data);
-      free(img);
-      
-                    }
-        }
-        else if(iResult==0)
-        {
-          //  printf("read closed");
-            ses->tcp.client_state=CLOSED; 
-        }
-      else  {
-         /// printf("\nlast error:%d",WSAGetLastError());
-           if (WSAGetLastError() != WSAEWOULDBLOCK)
-                                            
-                        ses->tcp.client_state=CLOSED; 
-                    }
-                    }  
-                    if(FD_ISSET(ses->client,&args->ctx->WriteSet))
-                    {
-                        // Forward data
-total--;
-											while (ses->tcp.forward != NULL)
-											{
-											 									//sending
-
-												ssize_t sent = send(ses->client, ses->tcp.forward->data + ses->tcp.forward->sent, ses->tcp.forward->len - ses->tcp.forward->sent,0);
-            //                                    printf("sent:%d",sent);
-												if (sent < 0)
-												{
-													if (WSAGetLastError() != WSAEWOULDBLOCK)
-													{
-													 	ses->tcp.client_state = CLOSED;
-                                                   		//	printf("\nsend closed");						
-														break;
-													}
-													else
-													{
-														 printf("\nretry seniding");
-														break;
-													}
-												}
-                                                else if(sent==0)
-                                                    ses->tcp.client_state = CLOSED;
-												else
-												{
-												 										//c->tcp.sent += sent;
-													ses->tcp.forward->sent += sent;
-													ses->tcp.sent+=sent;
-													if (ses->tcp.forward->sent == ses->tcp.forward->len)
-													{
-														struct segment *p = ses->tcp.forward;
-														ses->tcp.forward = ses->tcp.forward->next;
-														free(p->data);
-														free(p);
-													}
-													else
-													{
-														printf("\npartial sent");
-													}
-												}
-											}
-                                            if(ses->tcp.forward==NULL)//transfer completed
-                                            ses->tcp.client_state=CLOSED;
-                                                
-                        
-                    }
-                 ses=ses->next;   
-                       
-                
-                
-            }
-          
-      } 
-         
-   
-
-   
-    
+int socks5_auth_noauth(int fd)
+{
+	char answer[2] = { VERSION5, NOAUTH };
+	writen(fd, (void *)answer, ARRAY_SIZE(answer));
 	return 0;
-    }
-    
+}
+
+void socks5_auth_notsupported(int fd)
+{
+	char answer[2] = { VERSION5, NOMETHOD };
+	writen(fd, (void *)answer, ARRAY_SIZE(answer));
+}
+
+void socks5_auth(int fd, int methods_count)
+{
+	int supported = 0;
+	int num = methods_count;
+	for (int i = 0; i < num; i++) {
+		char type;
+		readn(fd, (void *)&type, 1);
+		log_message("Method AUTH %hhX", type);
+		if (type == auth_type) {
+			supported = 1;
+		}
+	}
+	if (supported == 0) {
+		socks5_auth_notsupported(fd);
+		app_thread_exit(1, fd);
+	}
+	int ret = 0;
+	switch (auth_type) {
+	case NOAUTH:
+		ret = socks5_auth_noauth(fd);
+		break;
+	case USERPASS:
+		ret = socks5_auth_userpass(fd);
+		break;
+	}
+	if (ret == 0) {
+		return;
+	} else {
+		app_thread_exit(1, fd);
+	}
+}
+
+int socks5_command(int fd)
+{
+	char command[4];
+	readn(fd, (void *)command, ARRAY_SIZE(command));
+	log_message("Command %hhX %hhX %hhX %hhX", command[0], command[1],
+		    command[2], command[3]);
+	return command[3];
+}
+
+unsigned short int socks_read_port(int fd)
+{
+	unsigned short int p;
+	readn(fd, (void *)&p, sizeof(p));
+	log_message("Port %hu", ntohs(p));
+	return p;
+}
+
+char *socks_ip_read(int fd)
+{
+	char *ip = (char *)malloc(sizeof(char) * IPSIZE);
+	readn(fd, (void *)ip, IPSIZE);
+	log_message("IP %hhu.%hhu.%hhu.%hhu", ip[0], ip[1], ip[2], ip[3]);
+	return ip;
+}
+
+void socks5_ip_send_response(int fd, char *ip, unsigned short int port)
+{
+	char response[4] = { VERSION5, OK, RESERVED, IP };
+	writen(fd, (void *)response, ARRAY_SIZE(response));
+	writen(fd, (void *)ip, IPSIZE);
+	writen(fd, (void *)&port, sizeof(port));
+}
+
+char *socks5_domain_read(int fd, unsigned char *size)
+{
+	unsigned char s;
+	readn(fd, (void *)&s, sizeof(s));
+	char *address = (char *)malloc((sizeof(char) * s) + 1);
+	readn(fd, (void *)address, (int)s);
+	address[s] = 0;
+	log_message("Address %s", address);
+	*size = s;
+	return address;
+}
+
+void socks5_domain_send_response(int fd, char *domain, unsigned char size,
+				 unsigned short int port)
+{
+	char response[4] = { VERSION5, OK, RESERVED, DOMAIN };
+	writen(fd, (void *)response, ARRAY_SIZE(response));
+	writen(fd, (void *)&size, sizeof(size));
+	writen(fd, (void *)domain, size * sizeof(char));
+	writen(fd, (void *)&port, sizeof(port));
+}
+
+int socks4_is_4a(char *ip)
+{
+	return (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] != 0);
+}
+
+int socks4_read_nstring(int fd, char *buf, int size)
+{
+	char sym = 0;
+	int nread = 0;
+	int i = 0;
+
+	while (i < size) {
+		nread = recv(fd, &sym, sizeof(char), 0);
+
+		if (nread <= 0) {
+			break;
+		} else {
+			buf[i] = sym;
+			i++;
+		}
+
+		if (sym == 0) {
+			break;
+		}
+	}
+
+	return i;
+}
+
+void socks4_send_response(int fd, int status)
+{
+	char resp[8] = {0x00, (char)status, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+	writen(fd, (void *)resp, ARRAY_SIZE(resp));
+}
+
+void app_socket_pipe(int fd0, int fd1)
+{
+	int maxfd, ret;
+	fd_set rd_set;
+	size_t nread;
+	char buffer_r[BUFSIZE];
+
+    log_message("Connecting two sockets");
+
+	maxfd = (fd0 > fd1) ? fd0 : fd1;
+	while (1) {
+		FD_ZERO(&rd_set);
+		FD_SET(fd0, &rd_set);
+		FD_SET(fd1, &rd_set);
+		ret = select(maxfd + 1, &rd_set, NULL, NULL, NULL);
+
+		if (ret < 0 && errno == EINTR) {
+			continue;
+		}
+
+		if (FD_ISSET(fd0, &rd_set)) {
+			nread = recv(fd0, buffer_r, BUFSIZE, 0);
+			if (nread <= 0)
+				break;
+			send(fd1, (const void *)buffer_r, nread, 0);
+		}
+
+		if (FD_ISSET(fd1, &rd_set)) {
+			nread = recv(fd1, buffer_r, BUFSIZE, 0);
+			if (nread <= 0)
+				break;
+			send(fd0, (const void *)buffer_r, nread, 0);
+		}
+	}
+}
+
+void *app_thread_process(void *fd)
+{
+	int net_fd = *(int *)fd;
+	int version = 0;
+	int inet_fd = -1;
+	char methods = socks_invitation(net_fd, &version);
+
+	switch (version) {
+	case VERSION5: {
+			socks5_auth(net_fd, methods);
+			int command = socks5_command(net_fd);
+
+			if (command == IP) {
+				char *ip = socks_ip_read(net_fd);
+				unsigned short int p = socks_read_port(net_fd);
+
+				inet_fd = app_connect(IP, (void *)ip, ntohs(p));
+				if (inet_fd == -1) {
+					app_thread_exit(1, net_fd);
+				}
+				socks5_ip_send_response(net_fd, ip, p);
+				free(ip);
+				break;
+			} else if (command == DOMAIN) {
+				unsigned char size;
+				char *address = socks5_domain_read(net_fd, &size);
+				unsigned short int p = socks_read_port(net_fd);
+
+				inet_fd = app_connect(DOMAIN, (void *)address, ntohs(p));
+				if (inet_fd == -1) {
+					app_thread_exit(1, net_fd);
+				}
+				socks5_domain_send_response(net_fd, address, size, p);
+				free(address);
+				break;
+			} else {
+				app_thread_exit(1, net_fd);
+			}
+		}
+		case VERSION4: {
+			if (methods == 1) {
+				char ident[255];
+				unsigned short int p = socks_read_port(net_fd);
+				char *ip = socks_ip_read(net_fd);
+				socks4_read_nstring(net_fd, ident, sizeof(ident));
+
+				if (socks4_is_4a(ip)) {
+					char domain[255];
+					socks4_read_nstring(net_fd, domain, sizeof(domain));
+					log_message("Socks4A: ident:%s; domain:%s;", ident, domain);
+					inet_fd = app_connect(DOMAIN, (void *)domain, ntohs(p));
+				} else {
+					log_message("Socks4: connect by ip & port");
+					inet_fd = app_connect(IP, (void *)ip, ntohs(p));
+				}
+
+				if (inet_fd != -1) {
+					socks4_send_response(net_fd, 0x5a);
+				} else {
+					socks4_send_response(net_fd, 0x5b);
+					free(ip);
+					app_thread_exit(1, net_fd);
+				}
+
+				free(ip);
+            } else {
+                log_message("Unsupported mode");
+            }
+			break;
+		}
+	}
+
+	app_socket_pipe(inet_fd, net_fd);
+	close(inet_fd);
+	app_thread_exit(0, net_fd);
+
+    return NULL;
+}
+
+int app_loop()
+{
+	int sock_fd, net_fd;
+	int optval = 1;
+	struct sockaddr_in local, remote;
+	socklen_t remotelen;
+	if ((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+		log_message("socket()");
+		exit(1);
+	}
+
+	if (setsockopt
+	    (sock_fd, SOL_SOCKET, SO_REUSEADDR, (char *)&optval,
+	     sizeof(optval)) < 0) {
+		log_message("setsockopt()");
+		exit(1);
+	}
+
+	memset(&local, 0, sizeof(local));
+	local.sin_family = AF_INET;
+	local.sin_addr.s_addr = htonl(INADDR_ANY);
+	local.sin_port = htons(port);
+
+	if (bind(sock_fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+		log_message("bind()");
+		exit(1);
+	}
+
+	if (listen(sock_fd, 25) < 0) {
+		log_message("listen()");
+		exit(1);
+	}
+
+	remotelen = sizeof(remote);
+	memset(&remote, 0, sizeof(remote));
+
+	log_message("Listening port %d...", port);
+
+	pthread_t worker;
+	while (1) {
+		if ((net_fd =
+		     accept(sock_fd, (struct sockaddr *)&remote,
+			    &remotelen)) < 0) {
+			log_message("accept()");
+			exit(1);
+		}
+        int one = 1;
+        setsockopt(sock_fd, SOL_TCP, TCP_NODELAY, &one, sizeof(one));
+		if (pthread_create
+		    (&worker, NULL, &app_thread_process,
+		     (void *)&net_fd) == 0) {
+			pthread_detach(worker);
+		} else {
+			log_message("pthread_create()");
+		}
+	}
+}
+
+void daemonize()
+{
+	pid_t pid;
+	int x;
+
+	pid = fork();
+
+	if (pid < 0) {
+		exit(EXIT_FAILURE);
+	}
+
+	if (pid > 0) {
+		exit(EXIT_SUCCESS);
+	}
+
+	if (setsid() < 0) {
+		exit(EXIT_FAILURE);
+	}
+
+	signal(SIGCHLD, SIG_IGN);
+	signal(SIGHUP, SIG_IGN);
+
+	pid = fork();
+
+	if (pid < 0) {
+		exit(EXIT_FAILURE);
+	}
+
+	if (pid > 0) {
+		exit(EXIT_SUCCESS);
+	}
+
+	umask(0);
+	chdir("/");
+
+	for (x = sysconf(_SC_OPEN_MAX); x >= 0; x--) {
+		close(x);
+	}
+}
+
+void usage(char *app)
+{
+	printf
+	    ("USAGE: %s [-h][-n PORT][-a AUTHTYPE][-u USERNAME][-p PASSWORD][-l LOGFILE]\n",
+	     app);
+	printf("AUTHTYPE: 0 for NOAUTH, 2 for USERPASS\n");
+	printf
+	    ("By default: port is 1080, authtype is no auth, logfile is stdout\n");
+	exit(1);
+}
+
+int main(int argc, char *argv[])
+{
+	int ret;
+	log_file = stdout;
+	auth_type = NOAUTH;
+	arg_username = "user";
+	arg_password = "pass";
+	pthread_mutex_init(&lock, NULL);
+
+	signal(SIGPIPE, SIG_IGN);
+
+	while ((ret = getopt(argc, argv, "n:u:p:l:a:hd")) != -1) {
+		switch (ret) {
+		case 'd':{
+				daemon_mode = 1;
+				daemonize();
+				break;
+			}
+		case 'n':{
+				port = atoi(optarg) & 0xffff;
+				break;
+			}
+		case 'u':{
+				arg_username = strdup(optarg);
+				break;
+			}
+		case 'p':{
+				arg_password = strdup(optarg);
+				break;
+			}
+		case 'l':{
+				freopen(optarg, "wa", log_file);
+				break;
+			}
+		case 'a':{
+				auth_type = atoi(optarg);
+				break;
+			}
+		case 'h':
+		default:
+			usage(argv[0]);
+		}
+	}
+	log_message("Starting with authtype %X", auth_type);
+	if (auth_type != NOAUTH) {
+		log_message("Username is %s, password is %s", arg_username,
+			    arg_password);
+	}
+	app_loop();
+	return 0;
+}
+
