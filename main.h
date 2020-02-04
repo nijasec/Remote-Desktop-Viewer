@@ -81,8 +81,12 @@ struct imageinfo{
    uint32_t h;
 };
 
-void startserver(struct arguments *args);
+
 struct imageinfo *getBitmapScreenshot();
 struct imageinfo *getPNGfromBMP(struct imageinfo *imginfo);
 
 int decodeBMPIMG(struct imageinfo *bmpinfo);
+void startserver(struct arguments *args);
+int monitor_tcp_session(const struct arguments *args, struct session *s);
+int check_tcp_session(const struct arguments *args,struct session *s);
+void clear_tcp_data(struct tcp_session *cur);
